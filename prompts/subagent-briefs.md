@@ -67,3 +67,58 @@ STOP CONDITIONS
 
 RETURN
 Write `docs/01-plan.md`. Reply with only the handoff (role format, at most 30 lines).
+
+---
+
+## Brief 2: Ahsoka (build and review), sent after docs/01-plan.md (verdict READY WITH RISKS)
+
+OBJECTIVE
+Build the converter that `docs/01-plan.md` specifies, then review it as the person who must sign it.
+- The task, verbatim, is `prompts/initial-prompt.md`.
+- Why it matters: an interview take-home. The repo has only docs today, and the interviewer judges correct SQL, honest limits and real tests.
+
+DONE MEANS
+- Every plan step 1–15 is done, or logged as a Deviation with a reason. That covers the code, the committed `output/`, `validation/` with real results, the top-level `README.md` and `docs/02-build.md`.
+- The plan §5 proof test was seen RED before the code that satisfies it, and is GREEN after.
+- The full pytest suite is green. `python -m pwc2dbt ... --all-mappings` exits with the code the plan predicts.
+- dbt debug, parse, compile and build were actually run on the generated project. Report the real results, including failures.
+- Mutation testing: at most 5 lines carrying the change, each mutated, then the targeted test run red, then reverted. Report N of M.
+
+READ FIRST (SP = /tmp/claude-0/-home-user-InfiniteLambda/abff589f-43e2-535b-816e-ab7ac6f63c6c/scratchpad)
+- `docs/01-plan.md`, all of it. It is your spec.
+- `docs/00-recon.md`, especially §8, PowerCenter semantics with doc sources.
+- `prompts/initial-prompt.md`, sections 7, 8, 9, 12 and 13.
+- The real XML: `SP/xml/FLOWLINE_DEMO_JAFFLESHOP.xml`. Copy it to `tests/fixtures/` (plan step 1).
+- The reference project: `SP/jaffle/jaffle-shop`. Hashi's probes, including the dbt-utils workaround: `SP/hashi/`.
+
+KNOWN FACTS (verified by Hayden and Hashi; re-verify anything load-bearing)
+- Recon §5.2 was WRONG: CUSTOMER_360 has 19 of 19 columns connected. Hayden truncated a dump line at 400 chars and read it as complete.
+- Recon §5.3 was partly wrong. Only `v_ORDER_SEQUENCE` is stateful. `EXP_MARK_FIRST_CUSTOMER` is pure under top-to-bottom variable evaluation.
+- Both corrections are real agent mistakes. The README must record them under "Coding agent mistakes", with how each was caught. Add any genuine mistakes of your own; never invent one.
+- dbt-core 1.12.6 with dbt-duckdb 1.11.1 installs from PyPI. GitHub cloning works. docs.informatica.com is blocked; do not retry it.
+
+LOCKED DECISIONS
+- D1–D7 in recon §7, plus every decision in plan §2–§4.
+- The user explicitly wants a top-level `README.md`. Do NOT create any other README files; the user removed one and called it not useful.
+- Plan step 13's `validation/README.md` is therefore replaced: put the validation results in a "Validation against Jaffle Shop" section of the top-level README, and in `docs/02-build.md`. Log this as a Deviation.
+
+CONSTRAINTS AND NON-GOALS
+- You are the only agent that edits code. Stay inside plan §3 scope; this is a Deep task, so a file outside scope means stop and report.
+- Create the venv at `.venv/` in the repo (gitignored). Keep scratch work in SP, not the repo.
+- No Jaffle-specific names in `src/` (no mapping, target or port names). Grep for them before you finish.
+- No silent fallbacks. An unsupported thing becomes INCOMPLETE with a diagnostic, or a fatal ERROR.
+- Do not commit or push. Hayden does that after the close.
+
+TRAPS
+- `/` in DuckDB is always a double. An overflowing DECIMAL cast raises an error at runtime, not compile time; check casts at target precision against the real seed data in validation.
+- The README example SQL must be copied from the real `output/` file, never written by hand.
+- Validation divergences against jaffle-shop are expected: swapped wiring, IS_PERISHABLE 'Y'/'1' vs 'True'/'False', dollars vs cents, the date truncation type. Explain each one with evidence; never "fix" the converter to match the reference.
+- Tests must assert values produced by executing the SQL, not keywords in the text.
+
+STOP CONDITIONS
+- The same check is still red after two genuine attempts: stop and report both attempts.
+- A file is needed outside plan §3 scope (Deep): stop and report.
+- The plan contradicts the XML: take the minimal correction and log a Deviation, unless it changes a locked decision, in which case stop.
+
+RETURN
+Write `docs/02-build.md`. Reply with only the handoff (role format, at most 30 lines).
