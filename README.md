@@ -48,6 +48,12 @@ Cross-mapping dependencies: a source whose name equals a target written in the s
 example `STG_ORDERS`) becomes `{{ ref('stg_orders') }}`. Every other source becomes
 `{{ source('<owner>', '<table>') }}`.
 
+The workflow `wf_FL_JAFFLESHOP_DEMO` runs the sessions in the order staging, then core marts, then
+enriched marts, and the demo repository's README describes the same flow. The data dependencies are
+narrower than that order suggests. `m_FL_JS_MARTS_ENRICHED` reads only `STG_*` tables, never a
+core-mart target, so the generated enriched models `ref()` staging models only. The DAG follows the
+data, not the session order.
+
 ## Install
 
 ```bash
@@ -270,7 +276,9 @@ build sandbox.
 **Setup.** `validation/run_validation.sh` does the following:
 
 1. Clones `dbt-labs/jaffle-shop` at commit `5beb145b`. This is the current Jaffle Shop, whose seeds
-   match the XML's RAW tables; `jaffle_shop_duckdb` has a different schema.
+   match the XML's RAW tables; `jaffle_shop_duckdb` has a different schema. The demo repository's
+   own README (`infinitelambda/flowline-pwc-demo`) says the export "reimplements the dbt Jaffle Shop
+   (https://github.com/dbt-labs/jaffle-shop)", which confirms this is the reference to use.
 2. Makes three edits so it runs on dbt 1.x: it drops `require-dbt-version` and the `dbt-cloud` block,
    and pins `dbt-utils` to git revision 1.3.0.
 3. Seeds and builds the reference into schema `main`.
