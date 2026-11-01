@@ -122,3 +122,61 @@ STOP CONDITIONS
 
 RETURN
 Write `docs/02-build.md`. Reply with only the handoff (role format, at most 30 lines).
+
+---
+
+## Brief 3: Ahsoka (defect loop 1 of 2), sent 2026-11-01 after the external doc check
+
+Defect-only brief. Fix exactly this defect, prove it, and update the affected docs. Nothing else.
+
+DEFECT
+`src/pwc2dbt/compiler.py#_Inputs.resolve` treats an input-port default of `ERROR(...)` as a WARNING and keeps the row. PowerCenter instead **skips** every row whose value on that port is NULL. That is silent wrong data (Law 12).
+
+EVIDENCE (PowerCenter 10.5 docs, read by an online Claude with a browser; quotes in `docs/00-recon.md` §8, "second pass")
+- "For input/output ports, the Integration Service uses default values to handle null input values." (general-rules-for-default-values.html)
+- The system default for null input is NULL, and it "appears as a blank in the transformation". (default-values-for-ports.html)
+- "When you use the ERROR function as a default value, the Integration Service skips the row with the null value ... It does not write these rows to the reject file." (skip-null-records.html)
+- "If any input port is unconnected, its value is assumed to be NULL and the Integration Service uses the default value for that input port."
+- Export survey: 186 of 188 Expression INPUT/OUTPUT ports have a blank DEFAULTVALUE, and all Joiner, Sorter, Filter, Aggregator and Source Qualifier I/O ports are blank too. Only `m_FL_JS_STAGING_FULL/EXP_LOCATIONS.TAX_RATE` and `EXP_ORDER_ITEMS.ORDER_ID` carry `ERROR('Transformation Error')`, so those two are user-defined.
+- OUTPUT-port defaults (`ERROR(...)`, `0`, `NULL`) apply only to transformation errors. They remain no-ops. Do not change them.
+
+REQUIRED BEHAVIOUR
+- **Row filter.** A connected INPUT or INPUT/OUTPUT port with an `ERROR(...)` default is a row-shaping rule, like a filter condition. The rows where that port's input is NULL must not leave the transformation.
+  - The rule applies even when no target column needs that port: it must be in the demand set whenever the transformation is used.
+  - Implement it for single-upstream transformations (Expression, Filter, Aggregator, Router, Sorter) as `where <input col> is not null` on the rows entering the transformation.
+  - Joiner and Union: implement it if it is simple and tested; otherwise make the model INCOMPLETE with a clear reason. Never keep the rows silently.
+- **Unconnected port.** If the port is not connected, every row would be skipped. Make the model INCOMPLETE and say so.
+- **ABORT default.** An input default of `ABORT(...)` makes the model INCOMPLETE, because it aborts the session on NULL.
+- **Diagnostic.** Emit a WARNING-level diagnostic per affected port, for example "rows where TAX_RATE is NULL are skipped, as PowerCenter's ERROR() default does". The behaviour must stay observable.
+- **Other defaults.** Keep the existing rule for other non-NULL constants (INCOMPLETE).
+
+PROOF (test-first)
+- Add an execution test in `tests/test_transformations.py`: a 3-row source where one row has NULL on an ERROR-default I/O port, and the row must be absent from the model output. Run it and see it RED on the current code, then GREEN.
+- The existing case `("ERROR('bad')", "WARNING")` in `test_input_port_default_values` encodes the defective behaviour. Hayden authorizes replacing that one case to match the documented behaviour. The replacement must be at least as strong; the execution test is the strong proof.
+- Add tests for the unconnected and ABORT cases.
+- Mutation-test the new filter line or lines, and report N of M.
+
+THEN
+- Regenerate `output/` with `--all-mappings --overwrite`. Expect `stg_locations` and `stg_order_items` to change.
+- Run `pytest -q` and `validation/run_validation.sh`. Report the real numbers. The sample has no NULLs there, so row counts should not change; verify that instead of assuming it.
+- Update the README:
+  - The "Defaults and parameters" bullet becomes the documented behaviour, with the doc URL.
+  - "Where the converter can produce incorrect output", item 1: remove `ERROR()` defaults from the [U] list.
+  - NULL semantics: IIF with a NULL condition is now confirmed by the doc's example table (iif.html), under the Integration Service default "Treat Null In Comparison Operators As = NULL". State that assumption. Under HIGH or LOW, comparisons with NULL change.
+  - Unconnected target columns: still [U]. The docs say only "The Integration Service ignores unconnected ports"; whether NULL or the DB column default is written is not stated.
+  - "Coding agent mistakes" gets a new entry, Hayden's:
+    - On 2026-11-01 Hayden read a search excerpt ("the output default value of input/output ports is always ERROR('Transformation Error')") and concluded these two ports carried the fixed default, so keeping the rows was correct. That was documented in the README.
+    - It was caught when the browser-read docs said I/O defaults handle null input, and a survey of the export showed the two ports were the only non-blank ones.
+- Append a "Defect loop 1" section to `docs/02-build.md`: evidence, red to green, mutations, and the regenerated-output diff summary.
+
+CONSTRAINTS
+- Read `.claude/commands/hayden.md`, sections "The Law" and "Field sense". They bind you, verbatim. Python, not TypeScript.
+- Touch only `src/pwc2dbt/compiler.py`, plus `ir.py` or `expressions.py` only if strictly needed. Also `tests/`, `output/` (regenerated), `README.md` and `docs/02-build.md`.
+- Use the existing `.venv/`. Do not commit or push.
+
+STOP CONDITIONS
+- The same check is still red after two genuine attempts: stop and report both.
+- The fix needs a change to the model-per-target design or to the ModelResult contract beyond adding diagnostics: stop and report.
+
+RETURN
+Reply with only the handoff: result, files changed, evidence (command -> exit code, proof red -> green, mutations N of M), output diff summary, README changes, risks. At most 25 lines.
