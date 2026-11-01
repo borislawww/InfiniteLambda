@@ -218,20 +218,22 @@ PowerCenter facts it shows:
 ## Assumptions
 
 Each of these is either a printed WARNING or listed here. **[U]** marks a claim that could not be
-checked against the Informatica documentation, because docs.informatica.com is blocked from the
-build sandbox.
+confirmed from the Informatica documentation. The documentation pages could not be read directly
+from the build sandbox (see Agent workflow), so claims were checked against search excerpts of them.
 
 - **Execution model.**
   - PowerCenter sessions run with high precision OFF, so decimal ports compute as doubles. Values
     are cast only at the Source Qualifier and at the target, and intermediate integer and decimal
     port types are not rounded **[U]**.
-  - Target types: Oracle `number(p,s)` becomes `decimal(p,s)`; `number` becomes `double` (Oracle
-    NUMBER without precision keeps fractions) **[U]**; `date` becomes `timestamp` (Oracle DATE has a
-    time part).
+  - Target types: Oracle `number(p,s)` becomes `decimal(p,s)`, and `number` becomes `double`. This
+    matches PowerCenter's own mapping, where Oracle Number maps to Double and Number(P,S) to Decimal
+    ([Oracle and Transformation Datatypes](https://docs.informatica.com/data-integration/powercenter/10-5/designer-guide/appendix-a--datatype-reference/oracle-and-transformation-datatypes.html)).
+    `date` becomes `timestamp`, because Oracle DATE has a time part.
   - Targets are truncated and reloaded by their sessions, so every model is materialized as `table`.
 - **NULL semantics.**
   - IIF with a NULL condition returns the else value, like SQL `CASE` **[U]**.
-  - Joiner keys that are NULL never match **[U]**.
+  - Joiner keys that are NULL never match, even when both sides are NULL
+    ([Defining a Join Condition](https://docs.informatica.com/data-integration/powercenter/10-4-0/transformation-guide/joiner-transformation/defining-a-join-condition.html)).
   - A filter or router condition that is NULL counts as FALSE, so a router row goes to the default
     group.
   - Aggregates ignore NULLs.
@@ -240,8 +242,17 @@ build sandbox.
   - `TO_DATE` with `YY`: DuckDB maps 69 to 99 to the 1900s, while PowerCenter uses the current century.
     This is a WARNING; results are identical for the years 2000 to 2068.
 - **Defaults and parameters.**
-  - An input-port default of `ERROR(...)` gives a WARNING (PowerCenter may reject NULL rows; the SQL
-    keeps them) **[U]**. Any other non-NULL input default makes the model INCOMPLETE.
+  - `ERROR(...)` on an INPUT/OUTPUT port gives a WARNING, and the rows are kept.
+    - The docs say the output default of an input/output port is *always* `ERROR('Transformation
+      Error')`, and a NULL input stays NULL unless the user sets an input default
+      ([Default Values for Ports](https://docs.informatica.com/data-integration/powercenter/10-5/transformation-guide/working-with-transformations/default-values-for-ports.html)).
+      Keeping the rows is therefore correct for the sample's two such ports (`EXP_LOCATIONS.TAX_RATE`
+      and `EXP_ORDER_ITEMS.ORDER_ID`), and the warning is conservative.
+    - A *user-defined* input default of `ERROR()` would make PowerCenter skip NULL rows
+      ([Skip Null Records](https://docs.informatica.com/data-integration/powercenter/10-5-8/transformation-guide/working-with-transformations/default-values-for-ports/user-defined-default-input-values/skip-null-records.html)).
+      The export does not distinguish the two cases in a way the converter can rely on. That is the
+      remaining risk, and it has no effect on the sample data, where neither column has NULLs.
+  - Any other non-NULL input default makes the model INCOMPLETE.
   - Output-port default values apply only to transformation errors, so they are ignored.
   - `$$RUN_DATE` has no parameter file in the export, so its default (`12/31/2025`) is used. Override
     it with `dbt build --vars '{run_date: "..."}'`.
@@ -254,9 +265,10 @@ build sandbox.
 
 ## Where the converter can produce incorrect output
 
-1. **Unverified PowerCenter semantics.** These are the **[U]** items above: Joiner NULL keys, IIF
-   with a NULL condition, `ERROR()` defaults, and `number` mapped to double. If PowerCenter behaves
-   differently, the SQL is silently different.
+1. **Unverified PowerCenter semantics.** These are the **[U]** items above: IIF with a NULL
+   condition, unconnected target columns, and intermediate port precision. Also, a user-defined
+   `ERROR()` input default cannot be told apart from the fixed output default of an input/output
+   port. If PowerCenter behaves differently, the SQL is silently different.
 2. **Variable port order.** Variables are evaluated in port order, as documented. A mapping that
    relies on the "previous row" idiom but declares the variables in the wrong order (here
    `EXP_MARK_FIRST_CUSTOMER`) is pure, so it is translated literally, and
@@ -402,8 +414,11 @@ Prompts, in order:
 
 Environment limits that shaped the work:
 
-- `hayden.boyanbalevengineering.com` and `docs.informatica.com` are blocked by the sandbox's network
-  policy. The skill was installed from the user's pasted text.
+- `hayden.boyanbalevengineering.com` is blocked by the sandbox's network policy, so the skill was
+  installed from the user's pasted text.
+- `docs.informatica.com` was blocked at first. After the user allowed it, the site's CDN still
+  answered 403 to command-line clients. The fetch tool could not resolve the host in this session,
+  and bypassing the bot check was rightly refused.
 - PowerCenter semantics were checked against search-engine excerpts of docs.informatica.com pages,
   with their URLs listed in `docs/00-recon.md` §8. Anything that could not be confirmed that way is
   marked **[U]** above.

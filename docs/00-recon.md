@@ -168,7 +168,7 @@ Method: web-search excerpts restricted to `docs.informatica.com` (PowerCenter 10
 | # | Claim | Status | Source |
 |---|---|---|---|
 | S1 | **Joiner, Master Outer:** keeps all detail rows plus the matching master rows, and discards unmatched master rows. In SQL, `detail LEFT JOIN master`. **Detail Outer** is the mirror image. | [D] | `.../10-5/transformation-guide/joiner-transformation/defining-the-join-type/master-outer-join.html`, `.../detail-outer-join.html` |
-| S2 | **Joiner:** do NULL keys match? | [U] | Treated like SQL equality: NULL never matches. Documented as an assumption. |
+| S2 | **Joiner:** NULL keys never match, even NULL against NULL. | [D] (added 2026-11-01) | `.../10-4-0/transformation-guide/joiner-transformation/defining-a-join-condition.html` |
 | S3 | **Router:** a row goes to *every* group whose condition is TRUE. The default group gets a row only when all conditions are FALSE. An unconnected group discards its rows. | [D] | `.../transformation-guide/router-transformation/working-with-groups/output-groups/the-default-group.html`, `.../user-defined-groups.html` |
 | S4 | **Union:** behaves like UNION ALL with no dedupe. It has many input groups and one output group with matching ports. It is "developed using the Custom transformation". | [D] | `.../10-5/transformation-guide/union-transformation/union-transformation-overview.html` |
 | S5 | **Union port matching:** the sample C code copies input port i to output port i, which suggests **positional** matching. | [D, weak] | `.../custom-transformation/.../step-3--fill-out-the-code-with-the-transformation-logic.html` |
@@ -183,3 +183,7 @@ Method: web-search excerpts restricted to `docs.informatica.com` (PowerCenter 10
 | S13 | **High precision off:** Decimal ports are processed as Double, so values over 15 digits lose precision. | [D] | `.../10-5/advanced-workflow-guide/high-precision-data/decimal.html` |
 | S14 | **Unconnected target columns** receive NULL, or the target default. | [U] | Assumption, to be documented. |
 | S15 | **Expression functions** (UPPER, LTRIM, RTRIM, ISNULL, TO_CHAR format tokens DD, MM, YY): standard behavior. | [U, low risk] | Not checked one by one. |
+| S16 | **Input/output ports:** the output default is always `ERROR('Transformation Error')`, and a NULL input stays NULL unless the user sets an input default. A user-defined input `ERROR()` default skips NULL rows. | [D] (added 2026-11-01) | `.../10-5/transformation-guide/working-with-transformations/default-values-for-ports.html`, `.../10-5-8/.../skip-null-records.html` |
+| S17 | **Oracle Number** (no precision) maps to Double (precision 15), and **Number(P,S)** maps to Decimal (up to 28). | [D] (added 2026-11-01) | `.../10-5/designer-guide/appendix-a--datatype-reference/oracle-and-transformation-datatypes.html` |
+
+Update 2026-11-01: docs.informatica.com was added to the environment's allowed domains. The proxy now passes the connection, but the site's CDN answers 403 to command-line clients, and the fetch tool still cannot resolve the host in this session. S2, S16 and S17 were confirmed through search excerpts as before. S11 and S14 remain [U].
