@@ -144,7 +144,8 @@ doc-backed, with quotes in the full README.
   could not reach.
 - The full sequence of my follow-up prompts is listed in
   [`docs/README-full.md`](docs/README-full.md#agent-workflow).
-- The full agent conversation export, from Claude Code's `/export`, goes in `prompts/agent-conversation.md`.
+- [`prompts/agent-conversation.md`](prompts/agent-conversation.md): the full agent conversation, rendered
+  from the session transcript (user messages, replies, tool calls, subagent reports).
 
 ## The process I followed with the agent
 
