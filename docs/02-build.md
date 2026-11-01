@@ -189,3 +189,76 @@ Both review fixes, finding 2 and finding 3, were also mutated off. Their new tes
    and the dbt-utils git 1.3.0 workaround, because the reference requires dbt ≥ 2.0.
 4. **Hayden should re-verify in a fresh shell.** The README sections on agent workflow and agent mistakes
    were written by Ahsoka from the briefs and the plan.
+
+## Defect loop 1 (2026-11-01): `ERROR()` input defaults keep rows
+
+Brief: `prompts/subagent-briefs.md`, "Brief 3". Nothing was committed.
+
+**Evidence.** PowerCenter 10.5 docs, read by an online Claude with a browser (quotes in
+`docs/00-recon.md` §8, "second pass"): I/O-port defaults handle NULL *input*; an `ERROR()` default
+skips the row; an unconnected input is NULL and takes the default. Re-probed in this session with lxml:
+188 Expression INPUT/OUTPUT ports, 186 blank and 2 `ERROR('Transformation Error')`
+(`EXP_LOCATIONS.TAX_RATE`, `EXP_ORDER_ITEMS.ORDER_ID`); every other input-capable port in the export
+is blank, except `EXP_ORDERS.ORDERED_AT` (`NULL`).
+
+**Fix** (`src/pwc2dbt/compiler.py`).
+- `_Inputs.skip_null_rows` returns one `<input> is not null` per input port with an `ERROR()`
+  default, its upstream items as row dependencies (so the rule holds when no target needs the port),
+  and one WARNING per port. An `ABORT()` default or an unconnected `ERROR()` input is a node problem
+  that names the port.
+- Expression, Filter, Router (every group, default included) and Aggregator (before `group by`) apply
+  it through `_where`, which parenthesizes an existing condition before adding the rules.
+- Sorter: `upstream_of` stops at a Sorter with any input default other than blank or `NULL`, and
+  `_build_node` builds it with `_filter` (no Filter Condition, same rules).
+- Joiner and Union: `row_default_port` makes the node INCOMPLETE. A pre-join filter needs a subquery
+  per side; no export has the case, so INCOMPLETE is the smaller correct choice.
+- `_Inputs.resolve` no longer warns on `ERROR()`; other non-NULL constants stay INCOMPLETE.
+
+**Red to green.**
+
+| Command | Exit code | Result |
+|---|---|---|
+| `pytest -q tests/test_transformations.py`, new tests on the old compiler | 1 | **RED**: 10 failed, 23 passed. Each execution case returned the NULL row `'b'` (e.g. `['a', 'b', 'c'] != ['a', 'c']`). |
+| The same, after the fix | 0 | **GREEN**: 33 passed |
+| `pytest -q` | 0 | 95 passed |
+| `python -m pyflakes src tests validation/compare.py` | 0 | Clean |
+| `python -m pwc2dbt --input tests/fixtures/FLOWLINE_DEMO_JAFFLESHOP.xml --output output --all-mappings --overwrite` | 2 | 14 complete, 2 incomplete, 0 errors, 16 warnings |
+| `validation/run_validation.sh` | 0 | Reference seed PASS=6, build PASS=43 NO-OP=3; generated debug OK, parse 14 models, build PASS=14 ERROR=0 |
+
+Tests: `test_input_port_default_values` had the case `("ERROR('bad')", "WARNING")`, which encoded the
+defect. Hayden authorized replacing it. Each case now also asserts the message: `ERROR` gives a
+WARNING "rows where X is NULL are skipped", `ABORT` gives INCOMPLETE, `0` gives INCOMPLETE. New:
+`test_error_default_on_an_input_port_skips_rows_with_null_input` (Expression, Filter with an OR
+condition, Sorter, Aggregator, Router default group; the target needs only `ID`, never `X`),
+`test_unconnected_input_port_with_error_default_is_incomplete`,
+`test_error_default_on_a_joiner_input_is_incomplete`, `test_error_default_on_a_union_input_is_incomplete`.
+
+**Mutations: 10 of 10 caught**, each reverted: no `is not null` emitted; `is not null` to `is null`;
+`_where` without parentheses; Expression row dependencies dropped; ABORT branch off; unconnected check
+off; Sorter kept transparent; Aggregator `where` dropped; Joiner refusal off; Router `where` without the
+rules.
+
+**Regenerated output.** Two files change, one line each: `stg_locations.sql` gains
+`where sq_raw_stores.tax_rate is not null` in `exp_locations`, and `stg_order_items.sql` gains
+`where sq_raw_items.order_id is not null` in `exp_order_items`. Row counts are unchanged and were
+checked, not assumed: `raw.raw_stores` 6 rows / 6 non-NULL `tax_rate`, `raw.raw_items` 90,900 / 90,900
+non-NULL `order_id`; `gen.stg_locations` 6 and `gen.stg_order_items` 90,900, as before. The comparison
+table is identical to the earlier run.
+
+**Deviations.**
+1. The Sorter rule uses any non-blank, non-`NULL` input default, not only `ERROR()`. One predicate
+   makes the Sorter a node, and the ordinary rules then apply; this also closes the earlier "Sorter
+   ports are not checked for input default values" finding.
+2. `skip_null_rows` returns its problem as a fourth value, not as an exception, so the INCOMPLETE
+   diagnostic names the port (the replaced test filters by port).
+
+**Review findings left, with the argument for leaving each.**
+- Source Qualifier port defaults are still not read. All 162 SQ ports in the export are blank, and
+  the Designer is believed not to allow SQ defaults (unverified). Fixing it adds a check to a builder
+  that no export needs.
+- Union could filter per input branch instead of being INCOMPLETE. That is a second code path with no
+  export behind it; INCOMPLETE is loud and easy to undo.
+- `ERROR ('x')` with a space is not recognised and becomes INCOMPLETE as "replaces NULL input": loud,
+  with a slightly wrong reason. The export never writes the space.
+- `docs/01-plan.md` step 6(f) still describes the old WARNING rule. It is outside this loop's files;
+  Hayden owns it.

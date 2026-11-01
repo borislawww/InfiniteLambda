@@ -105,8 +105,12 @@ def test_reference_to_an_output_port_is_incomplete(tmp_path):
     assert any("output port A" in m for m in _incomplete_messages(models["t"]))
 
 
-@pytest.mark.parametrize(("default", "severity"), [("ERROR('bad')", "WARNING"), ("0", "INCOMPLETE")])
-def test_input_port_default_values(tmp_path, default, severity):
+@pytest.mark.parametrize(("default", "severity", "message"), [
+    ("ERROR('bad')", "WARNING", "rows where X is NULL are skipped"),
+    ("ABORT('stop')", "INCOMPLETE", "aborts the session"),
+    ("0", "INCOMPLETE", "replaces NULL input"),
+])
+def test_input_port_default_values(tmp_path, default, severity, message):
     b = MappingBuilder().source("RAW_A", {"X": "number"})
     b.transformation("EXP", "Expression", [
         port("X", "INPUT/OUTPUT", "double", DEFAULTVALUE=default),
@@ -115,6 +119,59 @@ def test_input_port_default_values(tmp_path, default, severity):
     models, _ = compile_xml(tmp_path, b.xml())
     found = [d for d in models["t"].diagnostics if d.port == "X" and d.transformation == "EXP"]
     assert [d.severity for d in found] == [severity]
+    assert message in found[0].message
+
+
+def _error_default(type_: str) -> MappingBuilder:
+    """ID feeds the target; X has an ERROR() default and is needed by no target column."""
+    b = MappingBuilder().source("RAW_A", {"ID": "varchar2", "X": "number"})
+    x = {"datatype": "double", "DEFAULTVALUE": "ERROR('Transformation Error')"}
+    name = {"Expression": "EXP", "Filter": "FIL", "Sorter": "SRT", "Aggregator": "AGG", "Router": "RTR"}[type_]
+    if type_ == "Expression":
+        b.transformation(name, type_, [port("ID"), port("X", **x)])
+    elif type_ == "Filter":
+        # An OR condition: the skip rule must not bind to its last operand.
+        b.transformation(name, type_, [port("ID"), port("X", **x)], {"Filter Condition": "ID = 'b' OR ID = 'a'"})
+    elif type_ == "Sorter":
+        b.transformation(name, type_, [port("ID", ISSORTKEY="YES"), port("X", **x)], {"Distinct": "NO"})
+    elif type_ == "Aggregator":
+        b.transformation(name, type_, [port("ID", EXPRESSIONTYPE="GROUPBY"), port("X", "INPUT", **x),
+                                        port("N", "OUTPUT", "double", "COUNT(*)")], {"Sorted Input": "NO"})
+    else:  # Router: the rows reach the target through the default group.
+        b.transformation(name, type_, [port("ID", "INPUT", GROUP="INPUT"), port("X", "INPUT", GROUP="INPUT", **x),
+                                        port("ID1", "OUTPUT", GROUP="G_BIG", REF_FIELD="ID"),
+                                        port("ID2", "OUTPUT", GROUP="DEFAULT1", REF_FIELD="ID")],
+                         groups=[("INPUT", "INPUT", ""), ("G_BIG", "OUTPUT", "X > 100"),
+                                 ("DEFAULT1", "OUTPUT/DEFAULT", "")])
+    b.connect("SQ_RAW_A", name, ["ID", "X"])
+    b.target("T", {"ID": STR}).connect(name, "T", {"ID2" if type_ == "Router" else "ID": "ID"})
+    return b
+
+
+@pytest.mark.parametrize(("type_", "expected"), [
+    ("Expression", ["a", "c"]),
+    ("Filter", ["a"]),
+    ("Sorter", ["a", "c"]),
+    ("Aggregator", ["a", "c"]),
+    ("Router", ["a", "c"]),
+])
+def test_error_default_on_an_input_port_skips_rows_with_null_input(tmp_path, con, type_, expected):
+    models, _ = compile_xml(tmp_path, _error_default(type_).xml())
+    con.execute("create schema raw; create table raw.raw_a (id varchar, x integer);"
+                "insert into raw.raw_a values ('a', 1), ('b', null), ('c', 3)")
+    assert [r["id"] for r in run_model(con, models["t"], order_by="id")] == expected
+    assert any(d.severity == "WARNING" and d.port == "X" and "skipped" in d.message for d in models["t"].diagnostics)
+
+
+def test_unconnected_input_port_with_error_default_is_incomplete(tmp_path):
+    b = MappingBuilder().source("RAW_A", {"ID": "varchar2"})
+    b.transformation("EXP", "Expression", [
+        port("ID"), port("Y", "INPUT", DEFAULTVALUE="ERROR('Transformation Error')"),
+    ]).connect("SQ_RAW_A", "EXP", ["ID"])
+    b.target("T", {"ID": STR}).connect("EXP", "T", ["ID"])
+    models, _ = compile_xml(tmp_path, b.xml())
+    # Y is NULL on every row, so PowerCenter would skip them all.
+    assert any("Y is not connected" in m and "every row" in m for m in _incomplete_messages(models["t"]))
 
 
 # ---------------------------------------------------------------- Filter and Sorter
@@ -204,6 +261,13 @@ def test_union_follows_field_dependencies_not_port_order(tmp_path, con):
     assert run_model(con, models["t"], order_by="k") == [{"k": "k1", "v": "v1"}, {"k": "k2", "v": "v2"}]
 
 
+def test_error_default_on_a_union_input_is_incomplete(tmp_path):
+    xml = _router_union().xml().replace(
+        'NAME="X_HI" PORTTYPE="INPUT"', 'NAME="X_HI" PORTTYPE="INPUT" DEFAULTVALUE="ERROR(\'e\')"')
+    models, _ = compile_xml(tmp_path, xml)
+    assert any("X_HI has default value ERROR('e')" in m for m in _incomplete_messages(models["t"]))
+
+
 def test_custom_transformation_other_than_union_is_incomplete(tmp_path):
     b = MappingBuilder().source("RAW_A", {"K": "varchar2"})
     b.transformation("CT", "Custom Transformation", [port("K", "INPUT/OUTPUT")], {"Module Identifier": "mymodule"})
@@ -264,6 +328,13 @@ def test_master_outer_join_keeps_detail_rows_condition_either_side(tmp_path, con
 def test_join_condition_must_pair_master_and_detail(tmp_path):
     models, _ = compile_xml(tmp_path, _joiner("Normal Join", "K = V").xml())
     assert any("one master and one detail" in m for m in _incomplete_messages(models["t"]))
+
+
+def test_error_default_on_a_joiner_input_is_incomplete(tmp_path):
+    xml = _joiner("Normal Join", "K1 = K").xml().replace(
+        'NAME="W" PORTTYPE="INPUT/OUTPUT/MASTER"', 'NAME="W" PORTTYPE="INPUT/OUTPUT/MASTER" DEFAULTVALUE="ERROR(\'e\')"')
+    models, _ = compile_xml(tmp_path, xml)
+    assert any("W has default value ERROR('e')" in m for m in _incomplete_messages(models["t"]))
 
 
 # ---------------------------------------------------------------- Aggregator

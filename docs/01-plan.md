@@ -164,6 +164,7 @@ Write tests first, per §5 and §7. "Mirrors" names the convention followed. The
    - **(d) Final select.** `select cast(<up>.<col> as <target type>) as <target_col>` in target-field order. An unconnected target column becomes `cast(null as <type>)` with a WARNING and a SQL comment (S14 [U]).
    - **(e) D4 warning.** Raise a WARNING when a target column is fed by a differently named port whose name equals another column of the same target.
    - **(f) Input-port defaults.** `''` and `NULL` are no-ops. `ERROR(...)` gives a WARNING ("PowerCenter may reject rows with NULL X; generated SQL keeps them"). Any other value makes the model INCOMPLETE.
+     - **Amended 2026-11-01 (defect loop 1).** The documentation says an `ERROR()` input default *skips* rows with NULL input. The converter now emits `where <input> is not null` in Expression, Filter, Router, Aggregator and Sorter, plus a WARNING. Joiner and Union go INCOMPLETE. `ABORT()`, or an unconnected input with `ERROR()`, goes INCOMPLETE. See `docs/00-recon.md` §8 "second pass" and `docs/02-build.md` "Defect loop 1".
    - Status is set **once**, here: COMPLETE, or INCOMPLETE with the list of missing columns and reasons.
    - Mirrors: jaffle-shop CTE style.
 7. **`compiler.py` type maps.** These are the only two type boundaries; intermediate ports are never cast.

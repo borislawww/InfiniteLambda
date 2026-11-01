@@ -22,6 +22,7 @@ exp_locations as (
         sq_raw_stores.tax_rate as tax_rate,
         case when sq_raw_stores.tax_rate >= 0.15 then 'EMEA' else case when sq_raw_stores.tax_rate >= 0.09 then 'APAC' else 'AMER' end end as region
     from sq_raw_stores
+    where sq_raw_stores.tax_rate is not null
 
 ),
 

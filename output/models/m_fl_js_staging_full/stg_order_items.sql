@@ -19,6 +19,7 @@ exp_order_items as (
         sq_raw_items.order_id as order_id,
         sq_raw_items.sku as product_id
     from sq_raw_items
+    where sq_raw_items.order_id is not null
 
 )
 

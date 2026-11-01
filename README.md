@@ -85,7 +85,7 @@ python3 -m venv .venv
 ## Run the tests
 
 ```bash
-.venv/bin/pytest -q                 # 86 tests, about 2 s
+.venv/bin/pytest -q                 # 95 tests, about 2 s
 validation/run_validation.sh        # needs network: clones jaffle-shop, runs dbt, compares (about 1 min)
 ```
 
@@ -94,7 +94,7 @@ validation/run_validation.sh        # needs network: clones jaffle-shop, runs db
 | `test_parser.py` | Real-export counts (3 mappings, 12 sources, 16 targets, 1,066 connectors), ports, groups, field dependencies, instance-to-definition resolution, mapping-scoped names, Windows-1252, XXE, malformed and ambiguous exports. |
 | `test_graph.py` | Linear pipeline, a shared upstream used by both sides of a self-join, chained joiners, two instances of one source, multiple targets, cross-mapping `ref()`, cycles, bad references, fan-in, direction, unsafe names, unsupported types, propagation of incompleteness and of failed mappings, a target loaded by two mappings. |
 | `test_expressions.py` | Precedence, nested IIF, CRLF, NULL handling, DATE_DIFF, TRUNC, TO_CHAR and TO_DATE executed in DuckDB, 19 rejected constructs, aggregate rules. |
-| `test_transformations.py` | One fixture per transformation type, executed in DuckDB: Source Qualifier (plus Distinct and Source Filter), Expression (pass-through, variable inlining, stateful), Filter, Router (a row in two groups, and the default group), Sorter, Joiner (all four types, both condition orders, NULL keys), Aggregator, Union (field dependencies beat port order), target casts, unconnected target columns, input default values. |
+| `test_transformations.py` | One fixture per transformation type, executed in DuckDB: Source Qualifier (plus Distinct and Source Filter), Expression (pass-through, variable inlining, stateful), Filter, Router (a row in two groups, and the default group), Sorter, Joiner (all four types, both condition orders, NULL keys), Aggregator, Union (field dependencies beat port order), target casts, unconnected target columns, input default values (an `ERROR()` default drops NULL-input rows in each single-upstream type; Joiner, Union, `ABORT()` and unconnected cases are INCOMPLETE). |
 | `test_integration.py` | The real XML end to end: exit code 2, the exact model split, all 14 complete models executed on hand-made rows with semantic assertions, committed output equals regeneration, CLI exit codes, refusal to overwrite, no hard-coded names. |
 
 Tests assert values that DuckDB computed by running the generated SQL, not keywords in the text.
@@ -185,13 +185,14 @@ PowerCenter facts it shows:
 | Expression | Output ports translated; I/O ports passed through; pure local variables inlined in parentheses, in port order |
 | Filter | `where <condition>` |
 | Router | One CTE per needed group with `where <condition>`. The default group gets `where not coalesce(c1, false) and not coalesce(c2, false) ...`. A row can land in several groups. |
-| Sorter | Transparent, so no `ORDER BY` (dbt tables have no row order) |
+| Sorter | Transparent, so no `ORDER BY` (dbt tables have no row order). A Sorter with an input default value gets its own CTE, so the default rules below apply to it. |
 | Joiner | Normal becomes `inner join`. Master Outer becomes `detail left join master`. Detail Outer becomes `master left join detail`. Full Outer becomes `full outer join`. Conditions are conjunctions of `port = port`. |
 | Aggregator | `group by` the GROUPBY ports, with SUM, MIN, MAX, AVG, COUNT(port), COUNT(*), and expressions inside and around them |
 | Union (Custom Transformation `pmuniontrans`) | `union all`, input-to-output mapping taken from `FIELDDEPENDENCY` metadata |
 | Functions | IIF (3 arguments), ISNULL, UPPER, LTRIM and RTRIM (1 argument), TRUNC(date), TO_CHAR(date, fmt), TO_DATE(string, fmt), DATE_DIFF(d1, d2, 'D', 'DD' or 'DDD'), plus the aggregates above |
 | Operators | `+ - * / ||`, `= <> != < <= > >=`, NOT, AND, OR, unary minus, NULL |
 | Format strings | YYYY, YY, MM, DD, HH24, MI, SS, and the separators `- / : . ,` and space |
+| Input-port `ERROR()` default | Expression, Filter, Router, Aggregator and Sorter: `where <input> is not null` on the rows entering the transformation, whether or not a target needs the port, with a WARNING |
 | Mapping parameters | Date/time only, rendered as `cast('{{ var("run_date", "<export default>") }}' as timestamp)` |
 
 ## Unsupported (each one fails loudly as INCOMPLETE or ERROR, never silently)
@@ -207,6 +208,9 @@ PowerCenter facts it shows:
   from the previous row. Set-based SQL cannot express it, and the converter will not invent a window
   function for it.
 - **Joiners:** conditions other than port equalities, and case-insensitive string comparison.
+- **Input-port defaults:** `ERROR()` or `ABORT()` on a Joiner or Union input, `ABORT()` on any
+  input (it aborts the session on NULL), `ERROR()` on an unconnected input (every row would be
+  skipped), and any other non-NULL constant.
 - **Functions and arguments:** DECODE, NVL, SUBSTR, INSTR, CONCAT, ADD_TO_DATE and every other
   function not listed above; TO_CHAR on numbers; TRUNC with a format; LTRIM and RTRIM with a trim
   set; two-argument IIF; implicit type conversions such as comparing a string with a number.
@@ -231,7 +235,12 @@ from the build sandbox (see Agent workflow), so claims were checked against sear
     `date` becomes `timestamp`, because Oracle DATE has a time part.
   - Targets are truncated and reloaded by their sessions, so every model is materialized as `table`.
 - **NULL semantics.**
-  - IIF with a NULL condition returns the else value, like SQL `CASE` **[U]**.
+  - Comparisons with NULL return NULL. This assumes the Integration Service default "Treat Null In
+    Comparison Operators As = NULL"; under HIGH or LOW, comparisons with NULL change and the SQL
+    would differ.
+  - IIF with a NULL condition returns the else value, like SQL `CASE`. The doc's example table
+    shows this (`SALES = NULL` takes value2,
+    [IIF](https://docs.informatica.com/data-integration/powercenter/10-5/transformation-language-reference/functions/iif.html)).
   - Joiner keys that are NULL never match, even when both sides are NULL
     ([Defining a Join Condition](https://docs.informatica.com/data-integration/powercenter/10-4-0/transformation-guide/joiner-transformation/defining-a-join-condition.html)).
   - A filter or router condition that is NULL counts as FALSE, so a router row goes to the default
@@ -242,22 +251,27 @@ from the build sandbox (see Agent workflow), so claims were checked against sear
   - `TO_DATE` with `YY`: DuckDB maps 69 to 99 to the 1900s, while PowerCenter uses the current century.
     This is a WARNING; results are identical for the years 2000 to 2068.
 - **Defaults and parameters.**
-  - `ERROR(...)` on an INPUT/OUTPUT port gives a WARNING, and the rows are kept.
-    - The docs say the output default of an input/output port is *always* `ERROR('Transformation
-      Error')`, and a NULL input stays NULL unless the user sets an input default
-      ([Default Values for Ports](https://docs.informatica.com/data-integration/powercenter/10-5/transformation-guide/working-with-transformations/default-values-for-ports.html)).
-      Keeping the rows is therefore correct for the sample's two such ports (`EXP_LOCATIONS.TAX_RATE`
-      and `EXP_ORDER_ITEMS.ORDER_ID`), and the warning is conservative.
-    - A *user-defined* input default of `ERROR()` would make PowerCenter skip NULL rows
-      ([Skip Null Records](https://docs.informatica.com/data-integration/powercenter/10-5-8/transformation-guide/working-with-transformations/default-values-for-ports/user-defined-default-input-values/skip-null-records.html)).
-      The export does not distinguish the two cases in a way the converter can rely on. That is the
-      remaining risk, and it has no effect on the sample data, where neither column has NULLs.
+  - `ERROR(...)` as the default of an INPUT or INPUT/OUTPUT port skips every row whose input on
+    that port is NULL. The generated SQL drops those rows (`where <input> is not null`) and prints a
+    WARNING per port.
+    - "For input/output ports, the Integration Service uses default values to handle null input
+      values" ([General Rules for Default Values](https://docs.informatica.com/data-integration/powercenter/10-5/transformation-guide/working-with-transformations/default-values-for-ports/general-rules-for-default-values.html)).
+      The system default is NULL and shows as blank.
+    - "When you use the ERROR function as a default value, the Integration Service skips the row
+      with the null value" ([Skip Null Records](https://docs.informatica.com/data-integration/powercenter/10-5-8/transformation-guide/working-with-transformations/default-values-for-ports/user-defined-default-input-values/skip-null-records.html)).
+      Skipped rows are not written to the reject file.
+    - In the sample, 186 of 188 Expression I/O ports have a blank default. The two with
+      `ERROR('Transformation Error')`, `EXP_LOCATIONS.TAX_RATE` and `EXP_ORDER_ITEMS.ORDER_ID`, are
+      user-defined. Their columns hold no NULLs in the seeds, so no row is dropped.
+    - Joiner and Union inputs with such a default, an unconnected input with it, and any `ABORT()`
+      input default make the model INCOMPLETE.
   - Any other non-NULL input default makes the model INCOMPLETE.
   - Output-port default values apply only to transformation errors, so they are ignored.
   - `$$RUN_DATE` has no parameter file in the export, so its default (`12/31/2025`) is used. Override
     it with `dbt build --vars '{run_date: "..."}'`.
-- **Unconnected target columns** receive NULL, with a WARNING and a SQL comment **[U]**. None occur
-  in the sample.
+- **Unconnected target columns** receive NULL, with a WARNING and a SQL comment **[U]**. The docs
+  say only "The Integration Service ignores unconnected ports"; whether NULL or the database column
+  default is written is not stated. None occur in the sample.
 - **Cross-mapping refs** are resolved by table name only. A source and a target with the same name in
   different databases would be linked wrongly.
 - **Source data types** come from the loaded tables. In the jaffle-shop seeds `perishable` is
@@ -265,10 +279,10 @@ from the build sandbox (see Agent workflow), so claims were checked against sear
 
 ## Where the converter can produce incorrect output
 
-1. **Unverified PowerCenter semantics.** These are the **[U]** items above: IIF with a NULL
-   condition, unconnected target columns, and intermediate port precision. Also, a user-defined
-   `ERROR()` input default cannot be told apart from the fixed output default of an input/output
-   port. If PowerCenter behaves differently, the SQL is silently different.
+1. **Unverified PowerCenter semantics.** These are the **[U]** items above: unconnected target
+   columns and intermediate port precision. Also, NULL comparisons assume the Integration Service
+   default "Treat Null In Comparison Operators As = NULL". If PowerCenter behaves differently, the
+   SQL is silently different.
 2. **Variable port order.** Variables are evaluated in port order, as documented. A mapping that
    relies on the "previous row" idiom but declares the variables in the wrong order (here
    `EXP_MARK_FIRST_CUSTOMER`) is pure, so it is translated literally, and
@@ -277,8 +291,8 @@ from the build sandbox (see Agent workflow), so claims were checked against sear
 3. **Numeric precision.** Arithmetic runs in doubles and is rounded only at the target. If a session
    ran with high precision ON, PowerCenter would compute in decimals, and results could differ in the
    last digits.
-4. **Errors that PowerCenter raises per row.** PowerCenter rejects or skips rows on division by zero,
-   unparsable TO_DATE strings, and `ERROR()` defaults. DuckDB returns NULL for division by zero and
+4. **Errors that PowerCenter raises per row.** PowerCenter rejects or skips rows on division by zero
+   and unparsable TO_DATE strings. DuckDB returns NULL for division by zero and
    fails the whole query on a bad date. Every division in the sample is guarded by IIF.
 5. **Sorter order for stateful logic.** This is refused today. Any future support would depend on
    the sort order, which the converter currently ignores.
@@ -379,6 +393,15 @@ output to compare against.
    and `is_drink_item` as different. It had normalized booleans to `'1'` but decimals to `'1.0'`.
    - Caught by reading the rows behind the count.
    - Fixed in the normalization, without touching the converter.
+5. **An `ERROR()` input default was kept as a warning (Hayden, recon §8 S16).** On 2026-11-01
+   Hayden read a search excerpt ("the output default value of input/output ports is always
+   ERROR('Transformation Error')") and concluded that `EXP_LOCATIONS.TAX_RATE` and
+   `EXP_ORDER_ITEMS.ORDER_ID` carried that fixed default, so keeping the rows was correct. That was
+   documented in this README.
+   - Caught when the browser-read docs said that I/O-port defaults handle null input, and a survey
+     of the export showed those two ports were the only non-blank ones out of 188.
+   - Fixed in defect loop 1 (`docs/02-build.md`): such rows are now dropped, with a test that fails
+     on the old code.
 
 ## Agent workflow
 
@@ -410,7 +433,17 @@ Prompts, in order:
 6. "continue with Ahsoka once Hashi finishes", plus a request to remove a `prompts/README.md` file,
    and confirmation that this top-level README stays.
 7. `prompts/subagent-briefs.md`: the briefs Hayden gave Hashi and Ahsoka. Each was sent together
-   with the Law and Field-sense sections of the skill, verbatim.
+   with the Law and Field-sense sections of the skill, verbatim. Brief 3 is defect loop 1 (of a
+   maximum of 2).
+8. Follow-ups from the user:
+   - "create a pull request";
+   - the demo repo path and a description of PowerCenter;
+   - "I have added docs.informatica.com to the env allowed domains";
+   - a request for a status brief.
+9. `prompts/external-consult-informatica-docs.md`: a prompt Hayden wrote, at the user's request, for
+   an online Claude with a browser to read the Informatica pages that the sandbox could not reach.
+   The user relayed its answers back. They confirmed IIF and variable order, left unconnected target
+   columns unconfirmed, and exposed the `ERROR()` default defect (mistake 5).
 
 Environment limits that shaped the work:
 

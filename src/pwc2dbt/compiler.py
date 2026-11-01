@@ -41,6 +41,7 @@ _JOIN_TYPES = {
     "Full Outer Join": ("detail", "full outer join", "master"),
 }
 _PARAMETER_DEFAULT_FORMAT = "%m/%d/%Y %H:%M:%S"
+_ROW_DEFAULTS = ("ERROR(", "ABORT(")  # input-port defaults that skip the row or abort the session on NULL input
 
 Item = tuple[str, str]  # (instance name, port name upper)
 Node = tuple[str, str]  # (instance name, router group upper or "")
@@ -107,11 +108,15 @@ class _Graph:
         return self.mapping.transformations.get(inst.definition) if inst and inst.type == "TRANSFORMATION" else None
 
     def upstream_of(self, instance: str, port: str) -> Item | None:
-        """The output port feeding ``instance.port``, seen through Sorters. The only reader of connectors."""
+        """The output port feeding ``instance.port``, seen through Sorters that change no rows or values.
+
+        The only reader of connectors. A Sorter with Distinct or with an input default value is a node.
+        """
         found = self._into.get((instance, port.upper()))
         while found:
             sorter = self.transformation(found[0])
-            if not sorter or sorter.type != "Sorter" or sorter.attribute("Distinct") == "YES":
+            if not sorter or sorter.type != "Sorter" or sorter.attribute("Distinct") == "YES" or any(
+                    p.is_input and p.default_value.strip().upper() not in ("", "NULL") for p in sorter.ports):
                 return found
             found = self._into.get(found)
         return None
@@ -154,8 +159,10 @@ def _build_node(graph: _Graph, node: Node) -> _NodeBuild:
         "Aggregator": _aggregator,
         "Custom Transformation": _union,
     }
-    if t.type == "Sorter":
+    if t.type == "Sorter" and t.attribute("Distinct") == "YES":
         return _unsupported(instance, "Sorter with Distinct=YES removes duplicate rows; not supported")
+    if t.type == "Sorter":
+        return _filter(graph, node, t)  # a Sorter with input defaults: no Filter Condition, same row rules
     if t.type not in builders:
         return _unsupported(instance, f"transformation type {t.type!r} is not supported")
     return builders[t.type](graph, node, t)
@@ -188,15 +195,46 @@ class _Inputs:
         if up is None:
             raise ex.Unsupported(f"input port {port.name} is not connected")
         default = port.default_value.strip()
-        if default.upper().startswith("ERROR("):
-            warnings.append(
-                (self.instance, port.name, f"default value {default}: PowerCenter may reject rows where "
-                 f"{port.name} is NULL; the generated SQL keeps them")
-            )
-        elif default.upper() not in ("", "NULL"):
+        # ERROR() and ABORT() act on rows, not values: see skip_null_rows and row_default_port.
+        if default.upper() not in ("", "NULL") and not default.upper().startswith(_ROW_DEFAULTS):
             raise ex.Unsupported(f"input port {port.name} has default value {default!r}, which replaces NULL input")
         deps.append(up)
         return column_ref(self.graph, up, qualifier), ex.kind_of(port.datatype)
+
+    def row_default_port(self) -> Port | None:
+        """The first input port whose ERROR() or ABORT() default acts on the row when its input is NULL."""
+        ports = (p for p in self.t.ports if p.is_input and p.default_value.strip().upper().startswith(_ROW_DEFAULTS))
+        return next(ports, None)
+
+    def skip_null_rows(self) -> tuple[list[str], list[Item], list[Note], Note | None]:
+        """One ``is not null`` condition per input port with an ERROR() default, which skips rows with NULL input.
+
+        The rule applies to every row entering the transformation, whether or not a target needs the port.
+        Returns (conditions, deps, warnings, problem).
+        """
+        conditions: list[str] = []
+        deps: list[Item] = []
+        warnings: list[Note] = []
+        for port in self.t.ports:
+            default = port.default_value.strip()
+            if not port.is_input or not default.upper().startswith(_ROW_DEFAULTS):
+                continue
+            if default.upper().startswith("ABORT("):
+                return [], [], [], (self.instance, port.name, f"input port {port.name} has default value {default}, "
+                                                              "which aborts the session on NULL input")
+            if self.graph.upstream_of(self.instance, port.name) is None:
+                return [], [], [], (self.instance, port.name, f"input port {port.name} is not connected and has "
+                                                              f"default value {default}, so every row is skipped")
+            conditions.append(f"{self.resolve(port, None, deps, warnings)[0]} is not null")
+            warnings.append((self.instance, port.name, f"rows where {port.name} is NULL are skipped, as "
+                                                       f"PowerCenter's ERROR() default does"))
+        return conditions, deps, warnings, None
+
+
+def _where(condition: str, skips: list[str]) -> str:
+    """The WHERE clause: the transformation's own row condition, then the ERROR() default rules."""
+    parts = [c for c in (f"({condition})" if condition and skips else condition, *skips) if c]
+    return "\n    where " + "\n      and ".join(parts) if parts else ""
 
 
 def _translate_port(
@@ -287,6 +325,9 @@ def _expression(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
     upstream, problem = inputs.upstream_node([p for p in t.ports if p.is_input])
     if upstream is None:
         return _unsupported(instance, problem)
+    skips, skip_deps, skip_warnings, skip_problem = inputs.skip_null_rows()
+    if skip_problem:
+        return _NodeBuild(ports={}, render=lambda needed: "", problem=skip_problem)
     variables = [p for p in t.ports if p.is_variable]
     position = {v.name.upper(): i for i, v in enumerate(variables)}
     stateful: set[str] = set()
@@ -333,9 +374,9 @@ def _expression(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
     up_name = cte_name(upstream)
 
     def render(needed: list[str]) -> str:
-        return _select([f"{ports[n].sql[0]} as {n.lower()}" for n in needed], f"from {up_name}")
+        return _select([f"{ports[n].sql[0]} as {n.lower()}" for n in needed], f"from {up_name}" + _where("", skips))
 
-    return _NodeBuild(ports=ports, render=render)
+    return _NodeBuild(ports=ports, render=render, row_deps=tuple(skip_deps), warnings=tuple(skip_warnings))
 
 
 def _passthrough_ports(graph: _Graph, inputs: _Inputs, instance: str, ports: list[Port],
@@ -372,6 +413,9 @@ def _filter(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
     upstream, problem = inputs.upstream_node([p for p in t.ports if p.is_input])
     if upstream is None:
         return _unsupported(instance, problem)
+    skips, skip_deps, skip_warnings, skip_problem = inputs.skip_null_rows()
+    if skip_problem:
+        return _NodeBuild(ports={}, render=lambda needed: "", problem=skip_problem)
     text = t.attribute("Filter Condition").strip()
     try:
         where, row_deps, warnings = _condition(inputs, graph, text, instance) if text else ("", (), ())
@@ -381,10 +425,10 @@ def _filter(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
     up_name = cte_name(upstream)
 
     def render(needed: list[str]) -> str:
-        tail = f"from {up_name}" + (f"\n    where {where}" if where else "")
-        return _select([f"{ports[n].sql[0]} as {n.lower()}" for n in needed], tail)
+        return _select([f"{ports[n].sql[0]} as {n.lower()}" for n in needed], f"from {up_name}" + _where(where, skips))
 
-    return _NodeBuild(ports=ports, render=render, row_deps=row_deps, warnings=warnings)
+    return _NodeBuild(ports=ports, render=render, row_deps=row_deps + tuple(skip_deps),
+                      warnings=warnings + tuple(skip_warnings))
 
 
 def _router(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
@@ -393,6 +437,9 @@ def _router(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
     upstream, problem = inputs.upstream_node([p for p in t.ports if p.is_input])
     if upstream is None:
         return _unsupported(instance, problem)
+    skips, skip_deps, skip_warnings, skip_problem = inputs.skip_null_rows()
+    if skip_problem:
+        return _NodeBuild(ports={}, render=lambda needed: "", problem=skip_problem)
     group = next((g for g in t.groups if g.name.upper() == group_name), None)
     if group is None:
         return _unsupported(instance, f"output group {group_name} not found")
@@ -417,9 +464,10 @@ def _router(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
     up_name = cte_name(upstream)
 
     def render(needed: list[str]) -> str:
-        return _select([f"{ports[n].sql[0]} as {n.lower()}" for n in needed], f"from {up_name}\n    where {where}")
+        return _select([f"{ports[n].sql[0]} as {n.lower()}" for n in needed], f"from {up_name}" + _where(where, skips))
 
-    return _NodeBuild(ports=ports, render=render, row_deps=row_deps, warnings=warnings)
+    return _NodeBuild(ports=ports, render=render, row_deps=row_deps + tuple(skip_deps),
+                      warnings=warnings + tuple(skip_warnings))
 
 
 def _joiner(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
@@ -430,6 +478,9 @@ def _joiner(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
         return _unsupported(instance, f"join type {t.attribute('Join Type')!r} is not supported")
     if t.attribute("Case Sensitive String Comparison") == "NO":
         return _unsupported(instance, "case-insensitive string comparison is not supported")
+    if skipping := inputs.row_default_port():
+        return _unsupported(instance, f"input port {skipping.name} has default value {skipping.default_value.strip()}, "
+                                      "which skips or aborts on NULL input before the join; not supported")
     sides: dict[str, Node] = {}
     for side, is_master in (("master", True), ("detail", False)):
         upstream, problem = inputs.upstream_node([p for p in t.ports if p.is_input and p.is_master == is_master])
@@ -489,12 +540,15 @@ def _aggregator(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
         return _unsupported(instance, problem)
     if any(p.is_variable for p in t.ports):
         return _unsupported(instance, "variable ports in an Aggregator are not supported")
+    skips, skip_deps, skip_warnings, skip_problem = inputs.skip_null_rows()
+    if skip_problem:
+        return _NodeBuild(ports={}, render=lambda needed: "", problem=skip_problem)
     group_by = [p for p in t.ports if p.expression_type == "GROUPBY"]
     if not group_by:
         return _unsupported(instance, "an Aggregator without group-by ports is not supported")
     group_names = {p.name.upper() for p in group_by}
-    row_deps: list[Item] = []
-    warnings: list[Note] = []
+    row_deps: list[Item] = skip_deps
+    warnings: list[Note] = skip_warnings
     try:
         group_sql = [inputs.resolve(p, None, row_deps, warnings)[0] for p in group_by]
     except ex.Unsupported as exc:
@@ -526,7 +580,7 @@ def _aggregator(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
     up_name = cte_name(upstream)
 
     def render(needed: list[str]) -> str:
-        tail = f"from {up_name}\n    group by " + ", ".join(group_sql)
+        tail = f"from {up_name}" + _where("", skips) + "\n    group by " + ", ".join(group_sql)
         return _select([f"{ports[n].sql[0]} as {n.lower()}" for n in needed], tail)
 
     return _NodeBuild(ports=ports, render=render, row_deps=tuple(row_deps), warnings=tuple(warnings))
@@ -538,6 +592,9 @@ def _union(graph: _Graph, node: Node, t: Transformation) -> _NodeBuild:
         return _unsupported(instance, f"Custom transformation {t.attribute('Module Identifier')!r} is not supported "
                                       "(only the Union module pmuniontrans is)")
     inputs = _Inputs(graph, instance, t)
+    if skipping := inputs.row_default_port():
+        return _unsupported(instance, f"input port {skipping.name} has default value {skipping.default_value.strip()}, "
+                                      "which skips or aborts on NULL input before the union; not supported")
     in_groups = sorted((g for g in t.groups if g.type == "INPUT"), key=lambda g: g.order)
     upstreams: list[Node] = []
     for g in in_groups:
