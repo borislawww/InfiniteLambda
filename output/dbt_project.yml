@@ -1,0 +1,10 @@
+name: "flowline_demo_jaffleshop"
+version: "1.0.0"
+config-version: 2
+profile: "flowline_demo_jaffleshop"
+model-paths: ["models"]
+
+models:
+  flowline_demo_jaffleshop:
+    # Every target is truncated and reloaded by its session (Pre SQL TRUNCATE).
+    +materialized: table
