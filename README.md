@@ -414,8 +414,11 @@ Prompts, in order:
 
 Environment limits that shaped the work:
 
-- `hayden.boyanbalevengineering.com` is blocked by the sandbox's network policy, so the skill was
-  installed from the user's pasted text.
+- `hayden.boyanbalevengineering.com` was blocked at first, so the skill was installed from the
+  user's pasted text. Once the domain was allowed, the installed file was compared with the published
+  page: 183 of 185 substantive lines appear verbatim. The other 2 contain `<mission>`-style
+  placeholders that the HTML comparison could not match, so they are unconfirmed rather than
+  different.
 - `docs.informatica.com` was blocked at first. After the user allowed it, the site's CDN still
   answered 403 to command-line clients. The fetch tool could not resolve the host in this session,
   and bypassing the bot check was rightly refused.
